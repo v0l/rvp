@@ -82,6 +82,7 @@ impl DecoderThread {
             // skip packet, not playing
             return Ok(());
         }
+        self.decode_packet(pkt.as_ref())?;
         if pkt.is_none() {
             bail!("Stream ended (EOF)");
         }
@@ -89,8 +90,8 @@ impl DecoderThread {
         Ok(())
     }
 
-    fn decode_packet(&mut self, pkt: Option<AvPacketRef>) -> Result<()> {
-        let frames = self.decoder.decode_pkt(pkt.as_ref())?;
+    fn decode_packet(&mut self, pkt: Option<&AvPacketRef>) -> Result<()> {
+        let frames = self.decoder.decode_pkt(pkt)?;
         for (frame, stream_index) in frames {
             let stream = unsafe { self.demuxer.get_stream(stream_index as _)? };
             let frame = get_frame_from_hw(frame)?;

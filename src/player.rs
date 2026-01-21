@@ -656,19 +656,19 @@ impl Player {
         }
 
         if let Some(s) = updates.set_state {
-            self.state.store(s as _, Ordering::Relaxed);
+            self.state.state.store(s as _, Ordering::Relaxed);
             self.show_osd(&s.to_string())
         }
         if let Some(s) = updates.set_volume {
-            self.volume.store(s as _, Ordering::Relaxed);
+            self.state.volume.store(s as _, Ordering::Relaxed);
             self.show_osd(&format!("Volume: {}", s));
         }
         if let Some(s) = updates.set_muted {
-            self.muted.store(s as _, Ordering::Relaxed);
+            self.state.mute.store(s as _, Ordering::Relaxed);
             self.show_osd(&format!("Muted: {}", s));
         }
         if let Some(s) = updates.set_playback_speed {
-            self.playback_speed.store(s as _, Ordering::Relaxed);
+            self.state.speed.store(s as _, Ordering::Relaxed);
             self.show_osd(&format!("Speed: {}", s));
         }
         if let Some(s) = updates.set_seek {
@@ -676,9 +676,7 @@ impl Player {
             self.show_osd(&format!("Seek: {}", s));
         }
         if let Some(s) = updates.set_looping {
-            self.media_player
-                .data
-                .looping
+            self.state.looping
                 .store(s as _, Ordering::Relaxed);
             self.show_osd(&format!("Looping: {}", s));
         }
