@@ -8,12 +8,20 @@ use nom::error::context;
 use nom::multi::{many0, separated_list0};
 use nom::number::complete::double;
 use nom::sequence::{delimited, pair, preceded, tuple};
-use nom::IResult;
+use nom::{IResult, Parser};
 
-use super::{FadeEffect, Subtitle, SubtitleField};
+use super::{FadeEffect, Subtitle};
 
-fn num_list<'a>(i: &'a str) -> IResult<&'a str, Vec<f64>> {
-    delimited(char('('), separated_list0(char(','), double), char(')'))(i)
+enum SubtitleField<'a> {
+    Fade(FadeEffect),
+    Alignment(Align2),
+    PrimaryFill(Color32),
+    Position(Pos2),
+    Undefined(&'a str),
+}
+
+fn num_list(i: &str) -> IResult<&str, Vec<f64>> {
+    delimited(char('('), separated_list0(char(','), double), char(')')).parse(i)
 }
 
 fn tuple_int_2(v: Vec<f64>) -> Result<(i64, i64)> {
@@ -22,10 +30,13 @@ fn tuple_int_2(v: Vec<f64>) -> Result<(i64, i64)> {
 
 fn tuple_float_2(v: Vec<f64>) -> Result<(f64, f64)> {
     const FAIL_TEXT: &str = "invalid number of items";
-    Ok((*v.get(0).context(FAIL_TEXT)?, *v.get(1).context(FAIL_TEXT)?))
+    Ok((
+        *v.first().context(FAIL_TEXT)?,
+        *v.get(1).context(FAIL_TEXT)?,
+    ))
 }
 
-fn fad<'a>(i: &'a str) -> IResult<&'a str, SubtitleField> {
+fn fad(i: &str) -> IResult<&str, SubtitleField> {
     preceded(
         tag(r"\fad"),
         map(map_res(num_list, tuple_int_2), |f| {
@@ -35,10 +46,11 @@ fn fad<'a>(i: &'a str) -> IResult<&'a str, SubtitleField> {
             });
             fade_effect
         }),
-    )(i)
+    )
+    .parse(i)
 }
 
-fn t<'a>(i: &'a str) -> IResult<&'a str, SubtitleField> {
+fn t(i: &str) -> IResult<&str, SubtitleField> {
     preceded(
         tag(r"\t"),
         delimited(
@@ -48,10 +60,11 @@ fn t<'a>(i: &'a str) -> IResult<&'a str, SubtitleField> {
             }),
             char(')'),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
-fn an<'a>(i: &'a str) -> IResult<&'a str, SubtitleField> {
+fn an(i: &str) -> IResult<&str, SubtitleField> {
     preceded(
         tag(r"\an"),
         map_res(digit1, |s: &str| match s.parse::<i64>() {
@@ -68,16 +81,18 @@ fn an<'a>(i: &'a str) -> IResult<&'a str, SubtitleField> {
             Ok(9) => Ok(SubtitleField::Alignment(Align2::RIGHT_TOP)),
             _ => bail!("invalid alignment"),
         }),
-    )(i)
+    )
+    .parse(i)
 }
 
-fn pos<'a>(i: &'a str) -> IResult<&'a str, SubtitleField> {
+fn pos(i: &str) -> IResult<&str, SubtitleField> {
     preceded(
         tag(r"\pos"),
         map(map_res(num_list, tuple_float_2), |p| {
             SubtitleField::Position(Pos2::new(p.0 as f32, p.1 as f32))
         }),
-    )(i)
+    )
+    .parse(i)
 }
 
 // color parsing credit: example on https://github.com/rust-bakery/nom/tree/main
@@ -85,34 +100,37 @@ fn from_hex(i: &str) -> Result<u8> {
     Ok(u8::from_str_radix(i, 16)?)
 }
 fn is_hex_digit(c: char) -> bool {
-    c.is_digit(16)
+    c.is_ascii_hexdigit()
 }
 fn hex_primary(i: &str) -> IResult<&str, u8> {
-    map_res(take_while_m_n(2, 2, is_hex_digit), from_hex)(i)
+    map_res(take_while_m_n(2, 2, is_hex_digit), from_hex).parse(i)
 }
 fn hex_to_color32(i: &str) -> IResult<&str, Color32> {
     let (i, (blue, green, red)) = tuple((hex_primary, hex_primary, hex_primary))(i)?;
     Ok((i, Color32::from_rgb(red, green, blue)))
 }
-fn c<'a>(i: &'a str) -> IResult<&'a str, SubtitleField> {
+fn c(i: &str) -> IResult<&str, SubtitleField> {
     delimited(
         alt((tag(r"\c&H"), tag(r"\1c&H"))),
-        map(hex_to_color32, |c| SubtitleField::PrimaryFill(c)),
+        map(hex_to_color32, SubtitleField::PrimaryFill),
         tag("&"),
-    )(i)
+    )
+    .parse(i)
 }
-fn undefined<'a>(i: &'a str) -> IResult<&'a str, SubtitleField> {
+fn undefined(i: &str) -> IResult<&str, SubtitleField> {
     map(
         preceded(char('\\'), take_till(|c| "}\\".contains(c))),
-        |s| SubtitleField::Undefined(s),
-    )(i)
+        SubtitleField::Undefined,
+    )
+    .parse(i)
 }
-fn parse_style<'a>(i: &'a str) -> IResult<&'a str, Subtitle> {
+fn parse_style(i: &str) -> IResult<&str, Subtitle> {
     let (i, subtitle_style_components) = delimited(
         char('{'),
         many0(alt((t, fad, an, pos, c, undefined))),
         tuple((take_until("}"), char('}'))),
-    )(i)?;
+    )
+    .parse(i)?;
 
     let mut subtitle = Subtitle::default();
 
@@ -128,37 +146,35 @@ fn parse_style<'a>(i: &'a str) -> IResult<&'a str, Subtitle> {
     Ok((i, subtitle))
 }
 
-fn text_field<'a>(i: &'a str) -> IResult<&'a str, Subtitle> {
-    let (i, (subtitle, subtitle_text)) = preceded(opt_comma, pair(opt(parse_style), rest))(i)?;
+fn text_field(i: &str) -> IResult<&str, Subtitle> {
+    let (i, (subtitle, subtitle_text)) =
+        preceded(opt_comma, pair(opt(parse_style), rest)).parse(i)?;
     let mut subtitle = subtitle.unwrap_or_default();
-    subtitle.text = String::from(subtitle_text.replace(r"\N", "\n"));
+    subtitle.text = subtitle_text.replace(r"\N", "\n");
     Ok((i, subtitle))
 }
 
-fn not_comma<'a>(i: &'a str) -> IResult<&'a str, &'a str> {
+fn not_comma(i: &str) -> IResult<&str, &str> {
     is_not(",")(i)
 }
-fn comma<'a>(i: &'a str) -> IResult<&'a str, char> {
+fn comma(i: &str) -> IResult<&str, char> {
     char(',')(i)
 }
-fn opt_comma<'a>(i: &'a str) -> IResult<&'a str, Option<char>> {
-    opt(comma)(i)
+fn opt_comma(i: &str) -> IResult<&str, Option<char>> {
+    opt(comma).parse(i)
 }
 
-fn string_field<'a>(i: &'a str) -> IResult<&'a str, Option<String>> {
-    preceded(
-        opt_comma,
-        map(opt(not_comma), |s| s.map(|s| String::from(s))),
-    )(i)
+fn string_field(i: &str) -> IResult<&str, Option<String>> {
+    preceded(opt_comma, map(opt(not_comma), |s| s.map(String::from))).parse(i)
 }
 
-fn num_field<'a>(i: &'a str) -> IResult<&'a str, i32> {
-    preceded(opt_comma, map_res(digit0, str::parse))(i)
+fn num_field(i: &str) -> IResult<&str, i32> {
+    preceded(opt_comma, map_res(digit0, str::parse)).parse(i)
 }
 
-pub(crate) fn parse_ass_subtitle<'a>(i: &'a str) -> Result<Subtitle> {
+pub(crate) fn parse_ass_subtitle(i: &str) -> Result<Subtitle> {
     let (_i, (_layer, _start, _style, _name, _margin_l, _margin_r, _margin_v, _effect, subtitle)) =
-        tuple((
+        (
             context("layer", num_field),
             context("start", num_field),
             context("style", string_field),
@@ -168,8 +184,9 @@ pub(crate) fn parse_ass_subtitle<'a>(i: &'a str) -> Result<Subtitle> {
             context("margin_v", num_field),
             context("effect", string_field),
             context("style override + text", text_field),
-        ))(i)
-        .map_err(|e| anyhow!(format!("subtitle parse failed: {e}")))?;
+        )
+            .parse(i)
+            .map_err(|e| anyhow!(format!("subtitle parse failed: {e}")))?;
 
     Ok(subtitle)
 }
