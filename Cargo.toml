@@ -10,10 +10,11 @@ authors = ["n00kii", "v0l"]
 rust-version = "1.88"
 
 [features]
-default = ["default-overlay", "cpal", "ffmpeg", "hls"]
+default = ["default-overlay", "cpal", "avfoundation"]
 audio = ["dep:bungee-sys"]
 cpal = ["audio", "dep:cpal"]
 ffmpeg = ["dep:ffmpeg-rs-raw"]
+avfoundation = ["dep:objc2-av-foundation", "dep:objc2", "dep:objc2-foundation"]
 subtitles = ["dep:nom"]
 hls = ["ffmpeg", "dep:m3u8-rs", "dep:ureq", "dep:url", "dep:itertools"]
 default-overlay = []
@@ -38,6 +39,11 @@ ureq = { version = "3.0", optional = true }
 m3u8-rs = { version = "6.0", optional = true }
 url = { version = "2.5", optional = true }
 itertools = { version = "0.14", optional = true }
+
+# avfoundation
+objc2-av-foundation = { version = "0.3", optional = true, features = ["objc2-core-media"] }
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true}
 
 [dev-dependencies]
 eframe = { version = "0.33", features = ["persistence"] }

@@ -9,6 +9,8 @@ use std::thread::JoinHandle;
 
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;
+#[cfg(feature = "avfoundation")]
+mod avfoundation;
 
 #[derive(Clone, Debug)]
 pub struct DecoderInfo {
@@ -195,6 +197,8 @@ impl MediaDecoder {
     fn create_decoder(data: MediaDecoderThreadData) -> Result<Box<dyn MediaDecoderImpl>> {
         #[cfg(feature = "ffmpeg")]
         return Ok(Box::new(ffmpeg::FfmpegDecoderImpl::new(data)));
+        #[cfg(feature = "avfoundation")]
+        return Ok(Box::new(avfoundation::AvFoundationDecoder::new(data)));
         bail!("No decoder impl available!")
     }
 }
