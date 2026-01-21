@@ -1,6 +1,7 @@
 use eframe::NativeOptions;
-use egui::{CentralPanel, TextEdit, ViewportBuilder, Widget};
+use egui::{CentralPanel, Id, TextEdit, ViewportBuilder, Widget};
 use rvp::{DefaultOverlay, Player};
+use std::time::Duration;
 
 fn main() {
     env_logger::init();
@@ -13,6 +14,7 @@ fn main() {
 struct App {
     player: Option<Player>,
     media_path: String,
+    did_load: bool,
 }
 
 impl Default for App {
@@ -20,19 +22,29 @@ impl Default for App {
         Self {
             media_path: "".to_string(),
             player: None,
+            did_load: false,
         }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let path_id = Id::new("media_path");
         CentralPanel::default().show(ctx, |ui| {
+            if !self.did_load {
+                self.did_load = true;
+                let persisted = ui.data_mut(|d| d.get_persisted::<String>(path_id));
+                if let Some(path) = persisted {
+                    self.media_path = path.clone();
+                }
+            }
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!self.media_path.is_empty(), |ui| {
                     if ui.button("load").clicked() {
                         if let Ok(mut p) = Player::new(ctx, &self.media_path.replace("\"", "")) {
                             p.enable_keybinds(true);
                             self.player = Some(p.with_overlay(DefaultOverlay));
+                            ui.data_mut(|d| d.insert_persisted(path_id, self.media_path.clone()));
                         }
                     }
                 });
@@ -52,5 +64,9 @@ impl eframe::App for App {
                 player.ui(ui);
             }
         });
+    }
+
+    fn auto_save_interval(&self) -> Duration {
+        Duration::from_secs(1)
     }
 }

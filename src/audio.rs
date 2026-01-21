@@ -14,6 +14,7 @@ use std::sync::{Arc, mpsc};
 /// The playback device. Needs to be initialized (and kept alive!) for use by a [`Player`].
 pub struct AudioDevice(pub(crate) cpal::Device);
 
+/// Handle to an actively running audio stream
 pub struct AudioDeviceHandle {
     device: AudioDevice,
     stream: Stream,

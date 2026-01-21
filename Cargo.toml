@@ -40,5 +40,5 @@ url = { version = "2.5", optional = true }
 itertools = { version = "0.14", optional = true }
 
 [dev-dependencies]
-eframe = "0.33"
+eframe = { version = "0.33", features = ["persistence"] }
 env_logger = "0.11"
