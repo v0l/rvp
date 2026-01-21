@@ -80,18 +80,6 @@ pub(super) fn ffmpeg_decoder_thread(
                     return;
                 }
             };
-
-            for stream in probe.streams.iter() {
-                info!(
-                    "Setting up decoder for stream #{}: {} {}x{}",
-                    stream.index, stream.codec, stream.width, stream.height
-                );
-                if let Err(e) = decoder.setup_decoder(stream, None) {
-                    error!("Failed to setup decoder {}", e);
-                    return;
-                }
-            }
-
             let inf = DecoderInfo {
                 bitrate: probe.bitrate as _,
                 duration: probe.duration,
@@ -164,6 +152,22 @@ pub(super) fn ffmpeg_decoder_thread(
             selected_video.store(pick_video, Ordering::Relaxed);
             selected_audio.store(pick_audio, Ordering::Relaxed);
             selected_subtitle.store(pick_subtitle, Ordering::Relaxed);
+
+            for stream in probe.streams.iter() {
+                if stream.index == pick_video as _
+                    || stream.index == pick_audio as _
+                    || stream.index == pick_subtitle as _
+                {
+                    info!(
+                        "Setting up decoder for stream #{}: {} {}x{}",
+                        stream.index, stream.codec, stream.width, stream.height
+                    );
+                    if let Err(e) = decoder.setup_decoder(stream, None) {
+                        error!("Failed to setup decoder {}", e);
+                        return;
+                    }
+                }
+            }
 
             if let Err(e) = tx_m.send(inf) {
                 error!("Sender closed, shutting down: {}", e);
