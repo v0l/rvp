@@ -1,4 +1,4 @@
-use crate::PlayerState;
+use crate::{PlayerState, SharedPlaybackState};
 use crate::stream::AudioSamples;
 use anyhow::Result;
 use anyhow::bail;
@@ -43,11 +43,7 @@ impl AudioDevice {
     }
 
     pub fn open_default_audio_stream(
-        _volume: Arc<AtomicU16>,
-        _mute: Arc<AtomicBool>,
-        state: Arc<AtomicU8>,
-        _speed: Arc<AtomicI16>,
-        position: Arc<AtomicI64>,
+        p: SharedPlaybackState,
         rx: Receiver<AudioSamples>,
     ) -> Result<AudioDeviceHandle> {
         let device = AudioDevice::new()?;
@@ -71,11 +67,11 @@ impl AudioDevice {
                 }
                 let dst: &mut [i32] = data.as_slice_mut().unwrap();
                 dst.fill(0);
-                let state = state.load(Ordering::Relaxed);
+                let state = p.state.load(Ordering::Relaxed);
                 if state == PlayerState::Stopped as u8 || state == PlayerState::Paused as u8 {
                     return;
                 }
-                let current_pts = position.load(Ordering::Relaxed) as f64 / 1000.0;
+                let current_pts = p.pts.load(Ordering::Relaxed) as f64 / 1000.0;
                 let _frame_pts = current_pts;
 
                 // fill queue until dst is satisfied

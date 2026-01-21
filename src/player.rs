@@ -12,9 +12,12 @@ use egui::{
     StrokeKind, TextFormat, TextureHandle, TextureOptions, Ui, Vec2, Widget, pos2, vec2,
 };
 use log::{info, trace};
+use std::fmt::Display;
 use std::ops::Add;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU16, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI8, AtomicI16, AtomicI64, AtomicU8, AtomicU16, Ordering,
+};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -32,6 +35,17 @@ impl PlayerOverlay for NoOverlay {
     fn show(&self, _ui: &mut Ui, _frame_response: &Response, _p: &PlaybackInfo) -> PlaybackUpdate {
         PlaybackUpdate::default()
     }
+}
+
+/// Shared playback state
+#[derive(Clone)]
+pub struct SharedPlaybackState {
+    pub volume: Arc<AtomicU16>,
+    pub state: Arc<AtomicU8>,
+    pub speed: Arc<AtomicI8>,
+    pub mute: Arc<AtomicBool>,
+    pub looping: Arc<AtomicBool>,
+    pub pts: Arc<AtomicI64>,
 }
 
 /// Current state object from the player
@@ -88,10 +102,7 @@ impl PlaybackUpdate {
 /// Initialize once, and use the [`Player::ui`] or [`Player::ui_at()`] functions to show the playback.
 pub struct Player {
     overlay: Box<dyn PlayerOverlay>,
-    state: Arc<AtomicU8>,
-    volume: Arc<AtomicU16>,
-    muted: Arc<AtomicBool>,
-    playback_speed: Arc<AtomicI16>,
+    state: SharedPlaybackState,
     debug: bool,
 
     avg_fps: f32,
@@ -106,8 +117,6 @@ pub struct Player {
     frame_pts_end: f64,
     /// Clock time when the frame began
     frame_instant: Instant,
-    /// The current PTS in milliseconds
-    current_pts: Arc<AtomicI64>,
 
     /// How many frames have been rendered so far
     frame_counter: u64,
@@ -167,6 +176,17 @@ impl From<u8> for PlayerState {
     }
 }
 
+impl Display for PlayerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlayerState::Stopped => write!(f, "Stopped"),
+            PlayerState::Seeking => write!(f, "Seeking"),
+            PlayerState::Paused => write!(f, "Paused"),
+            PlayerState::Playing => write!(f, "Playing"),
+        }
+    }
+}
+
 impl Player {
     /// Store the next image
     fn load_frame(&mut self, frame: VideoFrame) {
@@ -199,7 +219,7 @@ impl Player {
 
     /// Check if the current frame should be flipped
     fn check_load_frame(&mut self) -> bool {
-        if self.state.load(Ordering::Relaxed) == PlayerState::Paused as u8 {
+        if self.state.state.load(Ordering::Relaxed) == PlayerState::Paused as u8 {
             // force frame to start now, while paused
             self.frame_instant = Instant::now();
             return false;
@@ -284,13 +304,14 @@ impl Player {
     }
 
     fn process_state(&mut self) {
-        let current_state = PlayerState::from(self.state.load(Ordering::Relaxed));
+        let current_state = PlayerState::from(self.state.state.load(Ordering::Relaxed));
         if self.stream_info.is_none()
             && let Ok(md) = self.rx_metadata.try_recv()
         {
             self.stream_info.replace(md);
             if current_state != PlayerState::Playing {
                 self.state
+                    .state
                     .store(PlayerState::Playing as _, Ordering::Relaxed);
             }
         }
@@ -304,7 +325,7 @@ impl Player {
         let duration_since_frame_start = self.frame_instant.elapsed().as_secs_f64();
         let current_pts = self.frame_pts + duration_since_frame_start;
         let current_pts = (current_pts * 1000.0) as _;
-        self.current_pts.store(current_pts, Ordering::Relaxed);
+        self.state.pts.store(current_pts, Ordering::Relaxed);
 
         // check if we should load the next video frame
         if !self.check_load_frame() {
@@ -406,7 +427,11 @@ impl Player {
     /// Get the currently playing video stream info
     fn current_video_stream(&self) -> Option<&StreamInfo> {
         if let Some(i) = self.stream_info.as_ref() {
-            let v_index = self.media_player.video_stream_index.load(Ordering::Relaxed);
+            let v_index = self
+                .media_player
+                .data
+                .selected_video
+                .load(Ordering::Relaxed);
             i.streams.iter().find(|s| s.index == v_index as _)
         } else {
             None
@@ -416,7 +441,11 @@ impl Player {
     /// Get the currently playing audio stream info
     fn current_audio_stream(&self) -> Option<&StreamInfo> {
         if let Some(i) = self.stream_info.as_ref() {
-            let v_index = self.media_player.audio_stream_index.load(Ordering::Relaxed);
+            let v_index = self
+                .media_player
+                .data
+                .selected_audio
+                .load(Ordering::Relaxed);
             i.streams.iter().find(|s| s.index == v_index as _)
         } else {
             None
@@ -428,7 +457,8 @@ impl Player {
         if let Some(i) = self.stream_info.as_ref() {
             let v_index = self
                 .media_player
-                .subtitle_stream_index
+                .data
+                .selected_subtitle
                 .load(Ordering::Relaxed);
             i.streams.iter().find(|s| s.index == v_index as _)
         } else {
@@ -501,33 +531,26 @@ impl Player {
 
     /// Create a new [`Player`].
     pub fn new(ctx: &egui::Context, input_path: &str) -> Result<Self> {
-        // volume arc
-        let vol = Arc::new(AtomicU16::new(u16::MAX));
-        let state = Arc::new(AtomicU8::new(PlayerState::Stopped as _));
-        let speed = Arc::new(AtomicI16::new(100));
-        let mute = Arc::new(AtomicBool::new(true));
-        let pts = Arc::new(AtomicI64::new(0));
+        let state = SharedPlaybackState {
+            state: Arc::new(AtomicU8::new(PlayerState::Stopped as _)),
+            volume: Arc::new(AtomicU16::new(u16::MAX)),
+            speed: Arc::new(AtomicI8::new(100)),
+            mute: Arc::new(AtomicBool::new(false)),
+            looping: Arc::new(AtomicBool::new(false)),
+            pts: Arc::new(AtomicI64::new(0)),
+        };
 
         let (media_player, streams) =
             MediaDecoder::new(input_path).expect("Failed to create media playback");
 
-        let audio = Self::open_audio(
-            vol.clone(),
-            mute.clone(),
-            state.clone(),
-            speed.clone(),
-            pts.clone(),
-            streams.audio,
-        )?;
+        let audio = Self::open_audio(state.clone(), streams.audio)?;
 
         let init_size = ctx.available_rect();
         Ok(Self {
             state,
-            playback_speed: speed,
             overlay: Box::new(NoOverlay),
             key_binds: false,
             input_path: input_path.to_string(),
-            volume: vol,
             frame: ctx.load_texture(
                 "video_frame",
                 ColorImage::filled(
@@ -539,7 +562,6 @@ impl Player {
             frame_instant: Instant::now(),
             frame_pts: 0.0,
             frame_pts_end: 0.0,
-            current_pts: pts,
             ctx: ctx.clone(),
             audio,
             subtitle: None,
@@ -558,7 +580,6 @@ impl Player {
             osd_end: Instant::now(),
             stream_info: None,
             rx_subtitle: streams.subtitle,
-            muted: mute,
         })
     }
 
@@ -570,18 +591,12 @@ impl Player {
 
     #[allow(unused)]
     fn open_audio(
-        volume: Arc<AtomicU16>,
-        mute: Arc<AtomicBool>,
-        state: Arc<AtomicU8>,
-        speed: Arc<AtomicI16>,
-        position: Arc<AtomicI64>,
+        state: SharedPlaybackState,
         rx: Receiver<AudioSamples>,
     ) -> Result<Box<dyn AudioDevice>> {
         #[cfg(feature = "audio")]
         return Ok(Box::new(
-            crate::audio::AudioDevice::open_default_audio_stream(
-                volume, mute, state, speed, position, rx,
-            )?,
+            crate::audio::AudioDevice::open_default_audio_stream(state, rx)?,
         ));
         Ok(Box::new(NoAudioDevice::new(rx)))
     }
@@ -591,13 +606,13 @@ impl Player {
         let size = ui.available_size();
 
         let state = PlaybackInfo {
-            state: self.state.load(Ordering::Relaxed).into(),
+            state: self.state.state.load(Ordering::Relaxed).into(),
             duration: self.stream_info.as_ref().map(|i| i.duration).unwrap_or(0.0),
-            elapsed: (self.current_pts.load(Ordering::Relaxed) as f64 / 1000.0) as _,
-            volume: self.volume.load(Ordering::Relaxed) as f32 / u16::MAX as f32,
-            muted: self.muted.load(Ordering::Relaxed),
-            playback_speed: self.playback_speed.load(Ordering::Relaxed) as f32 / i16::MAX as f32,
-            looping: self.media_player.looping.load(Ordering::Relaxed),
+            elapsed: (self.state.pts.load(Ordering::Relaxed) as f64 / 1000.0) as _,
+            volume: self.state.volume.load(Ordering::Relaxed) as f32 / u16::MAX as f32,
+            muted: self.state.mute.load(Ordering::Relaxed),
+            playback_speed: self.state.speed.load(Ordering::Relaxed) as f32 / i16::MAX as f32,
+            looping: self.media_player.data.looping.load(Ordering::Relaxed),
             fullscreen: self.fullscreen,
             debug: self.debug,
         };
@@ -642,28 +657,39 @@ impl Player {
 
         if let Some(s) = updates.set_state {
             self.state.store(s as _, Ordering::Relaxed);
+            self.show_osd(&s.to_string())
         }
         if let Some(s) = updates.set_volume {
             self.volume.store(s as _, Ordering::Relaxed);
+            self.show_osd(&format!("Volume: {}", s));
         }
         if let Some(s) = updates.set_muted {
             self.muted.store(s as _, Ordering::Relaxed);
+            self.show_osd(&format!("Muted: {}", s));
         }
         if let Some(s) = updates.set_playback_speed {
             self.playback_speed.store(s as _, Ordering::Relaxed);
+            self.show_osd(&format!("Speed: {}", s));
         }
         if let Some(s) = updates.set_seek {
             // TODO: make seeking
+            self.show_osd(&format!("Seek: {}", s));
         }
         if let Some(s) = updates.set_looping {
-            self.media_player.looping.store(s as _, Ordering::Relaxed);
+            self.media_player
+                .data
+                .looping
+                .store(s as _, Ordering::Relaxed);
+            self.show_osd(&format!("Looping: {}", s));
         }
         if let Some(s) = updates.set_fullscreen {
             self.fullscreen = s;
             // TODO: make fullscreen
+            self.show_osd(&format!("Fullscreen: {}", s));
         }
         if let Some(s) = updates.set_debug {
             self.debug = s;
+            self.show_osd(&format!("Debug: {}", s));
         }
     }
 

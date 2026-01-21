@@ -1,8 +1,9 @@
+use anyhow::Result;
 use anyhow::bail;
 use egui::ColorImage;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicIsize};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
@@ -43,8 +44,8 @@ impl Display for StreamInfo {
             StreamType::Video => {
                 write!(
                     f,
-                    "V #{}: {} {}x{}@{}",
-                    self.index, self.codec, self.width, self.height, self.format,
+                    "V #{}: {} {}x{}@{} {}fps",
+                    self.index, self.codec, self.width, self.height, self.format, self.fps
                 )
             }
             StreamType::Audio => {
@@ -117,43 +118,69 @@ pub struct MediaStreams {
 pub struct MediaDecoder {
     /// Thread which decodes the media stream
     thread: JoinHandle<()>,
-    /// If the stream should loop
+    /// Instance of the internal decoder
+    internal: Box<dyn MediaDecoderImpl + 'static>,
+
+    /// Internal shared data
+    pub data: MediaDecoderThreadData,
+}
+
+/// Data shared with the decoder thread including decoder controls
+#[derive(Debug, Clone)]
+pub struct MediaDecoderThreadData {
+    pub path: String,
+
     pub looping: Arc<AtomicBool>,
-    /// The index of the primary video stream being decoded
-    pub video_stream_index: Arc<AtomicIsize>,
-    /// The index of the primary audio stream being decoded
-    pub audio_stream_index: Arc<AtomicIsize>,
-    /// The index of the primary subtitle stream being decoded
-    pub subtitle_stream_index: Arc<AtomicIsize>,
+
+    // selected streams to decode and send data
+    pub selected_video: Arc<AtomicIsize>,
+    pub selected_audio: Arc<AtomicIsize>,
+    pub selected_subtitle: Arc<AtomicIsize>,
+
+    // channels to send data back
+    pub tx_m: SyncSender<DecoderInfo>,
+    pub tx_v: SyncSender<VideoFrame>,
+    pub tx_a: SyncSender<AudioSamples>,
+    pub tx_s: SyncSender<SubtitlePacket>,
+
+    // audio resample format
+    pub sample_rate: Arc<AtomicU32>,
+    pub channels: Arc<AtomicU8>,
+}
+
+pub trait MediaDecoderImpl {
+    /// Start the decoder thread
+    fn start(&mut self) -> Result<JoinHandle<()>>;
 }
 
 impl MediaDecoder {
     /// Creates a new media player stream and returns the receiver channel
-    pub fn new(input: &str) -> anyhow::Result<(Self, MediaStreams)> {
+    pub fn new(input: &str) -> Result<(Self, MediaStreams)> {
         let (tx_m, rx_m) = sync_channel(1);
         let (tx_v, rx_v) = sync_channel(10);
         let (tx_a, rx_a) = sync_channel(1_000);
         let (tx_s, rx_s) = sync_channel(10);
-        let stream_v = Arc::new(AtomicIsize::new(-1));
-        let stream_a = Arc::new(AtomicIsize::new(-1));
-        let stream_s = Arc::new(AtomicIsize::new(-1));
-        let thread = Self::spawn_decoder(
-            input,
-            stream_v.clone(),
-            stream_a.clone(),
-            stream_s.clone(),
+
+        let thread_data = MediaDecoderThreadData {
+            path: input.to_string(),
+            looping: Arc::new(AtomicBool::new(false)),
+            selected_video: Arc::new(AtomicIsize::new(-1)),
+            selected_audio: Arc::new(AtomicIsize::new(-1)),
+            selected_subtitle: Arc::new(AtomicIsize::new(-1)),
             tx_m,
             tx_v,
             tx_a,
             tx_s,
-        )?;
+            sample_rate: Arc::new(AtomicU32::new(44_100)),
+            channels: Arc::new(AtomicU8::new(2)),
+        };
+        let mut internal = Self::create_decoder(thread_data.clone())?;
+        let thread = internal.start()?;
         Ok((
             Self {
                 thread,
-                looping: Default::default(),
-                video_stream_index: stream_v,
-                audio_stream_index: stream_a,
-                subtitle_stream_index: stream_s,
+                internal,
+                data: thread_data,
             },
             MediaStreams {
                 metadata: rx_m,
@@ -165,27 +192,9 @@ impl MediaDecoder {
     }
 
     #[allow(unused_variables)]
-    fn spawn_decoder(
-        input: &str,
-        selected_video: Arc<AtomicIsize>,
-        selected_audio: Arc<AtomicIsize>,
-        selected_subtitle: Arc<AtomicIsize>,
-        tx_m: SyncSender<DecoderInfo>,
-        tx_v: SyncSender<VideoFrame>,
-        tx_a: SyncSender<AudioSamples>,
-        tx_s: SyncSender<SubtitlePacket>,
-    ) -> anyhow::Result<JoinHandle<()>> {
+    fn create_decoder(data: MediaDecoderThreadData) -> Result<Box<dyn MediaDecoderImpl>> {
         #[cfg(feature = "ffmpeg")]
-        return ffmpeg::ffmpeg_decoder_thread(
-            input,
-            selected_video,
-            selected_audio,
-            selected_subtitle,
-            tx_m,
-            tx_v,
-            tx_a,
-            tx_s,
-        );
+        return Ok(Box::new(ffmpeg::FfmpegDecoderImpl::new(data)));
         bail!("No decoder impl available!")
     }
 }
