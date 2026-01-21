@@ -3,7 +3,7 @@ use crate::stream::AudioSamples;
 use anyhow::Result;
 use anyhow::bail;
 use bungee_sys::BungeeStream;
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use log::{info, trace};
 use std::collections::VecDeque;
@@ -104,7 +104,7 @@ impl AudioDevice {
             },
             None,
         )?;
-
+        stream.play()?;
         Ok(AudioDeviceHandle { device, stream })
     }
 }
