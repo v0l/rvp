@@ -80,8 +80,8 @@ impl DecoderThread {
         }
 
         let (pkt, _) = unsafe { self.demuxer.get_packet()? };
-        let v_index = self.data.selected_video.load(Ordering::Relaxed);
-        let a_index = self.data.selected_audio.load(Ordering::Relaxed);
+        let v_index = self.data.playback.selected_video.load(Ordering::Relaxed);
+        let a_index = self.data.playback.selected_audio.load(Ordering::Relaxed);
         // let s_index = self.data.selected_subtitle.load(Ordering::Relaxed);
         if let Some(pkt) = pkt.as_ref()
             && !(pkt.stream_index == v_index as _ || pkt.stream_index == a_index as _)
@@ -148,32 +148,23 @@ impl DecoderThread {
         let frame = self.resample.process_frame(&frame)?;
         self.data.tx_a.send(AudioSamples {
             data: unsafe {
-                if av_sample_fmt_is_planar(FfmpegDecoder::OUT_SAMPLE_FORMAT) == 1 {
-                    frame
-                        .data
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(line, data)| {
-                            if data.is_null() {
-                                None
-                            } else {
-                                Some(
-                                    std::slice::from_raw_parts(
-                                        *data as *mut _,
-                                        frame.linesize[line] as _,
-                                    )
-                                    .to_vec(),
+                frame
+                    .data
+                    .iter()
+                    .filter_map(|data| {
+                        if data.is_null() {
+                            None
+                        } else {
+                            Some(
+                                std::slice::from_raw_parts(
+                                    *data as *mut _,
+                                    frame.linesize[0] as _,
                                 )
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    std::slice::from_raw_parts(
-                        frame.extended_data as *const _,
-                        (frame.nb_samples * frame.ch_layout.nb_channels) as usize,
-                    )
-                    .to_vec()
-                }
+                                .to_vec(),
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
             },
             samples: frame.nb_samples as usize,
             stream_index,
@@ -226,12 +217,15 @@ impl DecoderThread {
             .map(|s| s.index as isize)
             .unwrap_or(-1);
         self.data
+            .playback
             .selected_video
             .store(pick_video, Ordering::Relaxed);
         self.data
+            .playback
             .selected_audio
             .store(pick_audio, Ordering::Relaxed);
         self.data
+            .playback
             .selected_subtitle
             .store(pick_subtitle, Ordering::Relaxed);
 
@@ -317,8 +311,8 @@ impl MediaDecoderImpl for FfmpegDecoder {
             scaler: Scaler::new(),
             resample: Resample::new(
                 Self::OUT_SAMPLE_FORMAT,
-                self.data.sample_rate.load(Ordering::Relaxed),
-                self.data.channels.load(Ordering::Relaxed) as _,
+                self.data.playback.sample_rate.load(Ordering::Relaxed),
+                self.data.playback.channels.load(Ordering::Relaxed) as _,
             ),
             info: None,
         };

@@ -8,6 +8,7 @@ use cpal::{SampleFormat, Stream, StreamConfig};
 use log::{error, info, trace};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
+use std::pin::pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU16, Ordering};
 use std::sync::mpsc::Receiver;
@@ -62,22 +63,28 @@ impl AudioDevice {
         let device = AudioDevice::new()?;
         let cfg = device.0.default_output_config()?;
         info!(
-            "Default audio device config: {}Hz, {}ch, {:?}",
+            "Default audio device config: {} {}Hz, {}ch, {:?}",
+            device.0.description()?.name(),
             cfg.sample_rate(),
             cfg.channels(),
-            cfg.sample_format()
+            cfg.sample_format(),
+
         );
 
         let channels = cfg.channels() as u8;
         let sample_rate = cfg.sample_rate() as u32;
         let mut first_frame = false;
 
+        // update the playback state with the audio device playback details
+        p.sample_rate.store(sample_rate, Ordering::Relaxed);
+        p.channels.store(channels, Ordering::Relaxed);
+
         let mut simple_queue = Vec::new();
         for _ in 0..channels {
             simple_queue.push(VecDeque::new());
         }
         let mut queue_head_pts = 0.0;
-        let mut bungee_stream = BungeeWrapper::new(channels, sample_rate)?;
+        let mut bungee_stream = BungeeWrapper::new(channels, sample_rate, sample_rate)?;
         let stream = device.0.build_output_stream_raw(
             &cfg.config(),
             SampleFormat::F32,
@@ -143,7 +150,11 @@ impl AudioDevice {
 
                 let out_samples_len = dst.len() / channels as usize;
                 let mut out_samples = Vec::with_capacity(channels as usize);
-                out_samples.fill(Vec::with_capacity(out_samples_len));
+                out_samples.resize_with(channels as _, || {
+                    let mut v_line = Vec::with_capacity(out_samples_len);
+                    v_line.resize(out_samples_len, 0.0);
+                    v_line
+                });
 
                 if let Err(e) = bungee_stream.process(
                     in_samples,
@@ -172,7 +183,7 @@ impl AudioDevice {
     }
 }
 
-pub struct BungeeWrapper {
+struct BungeeWrapper {
     ctx: NonNull<BungeeStream>,
     _marker: PhantomData<BungeeStream>,
 }
@@ -180,11 +191,11 @@ pub struct BungeeWrapper {
 unsafe impl Send for BungeeWrapper {}
 
 impl BungeeWrapper {
-    pub fn new(channels: u8, sample_rate: u32) -> Result<BungeeWrapper> {
+    pub fn new(channels: u8, in_rate: u32, out_rate: u32) -> Result<BungeeWrapper> {
         let ctx = {
             let samples = bungee_sys::SampleRates {
-                input: sample_rate as _,
-                output: sample_rate as _,
+                input: in_rate as _,
+                output: out_rate as _,
             };
             let stretcher = bungee_sys::stretcher::create(samples, channels as _, 2);
             if stretcher.is_null() {
@@ -209,17 +220,22 @@ impl BungeeWrapper {
         out_data: &mut Vec<Vec<f32>>,
         out_samples: usize,
     ) -> Result<()> {
-        let ret = bungee_sys::stream::process(
+        let mut ptr_in = Vec::new();
+        for line in in_data.iter() {
+            ptr_in.push(std::ptr::addr_of!(line));
+        }
+        let mut ptr_out = Vec::new();
+        for mut line in out_data.into_iter() {
+            ptr_out.push(std::ptr::addr_of_mut!(line));
+        }
+        bungee_sys::stream::process(
             self.ctx.as_ptr(),
-            in_data.as_ptr() as *const *const f32,
-            out_data.as_mut_ptr() as *mut *mut _,
+            ptr_in.as_ptr() as _,
+            ptr_out.as_mut_ptr() as _,
             in_samples as _,
             out_samples as _,
             1.0,
         );
-        if ret != 0 {
-            bail!("Failed to process audio");
-        }
         Ok(())
     }
 }

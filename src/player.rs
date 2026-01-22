@@ -16,7 +16,8 @@ use std::fmt::Display;
 use std::ops::Add;
 use std::sync::Arc;
 use std::sync::atomic::{
-    AtomicBool, AtomicI8, AtomicI16, AtomicI64, AtomicU8, AtomicU16, Ordering,
+    AtomicBool, AtomicI8, AtomicI16, AtomicI64, AtomicIsize, AtomicU8, AtomicU16, AtomicU32,
+    Ordering,
 };
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -38,7 +39,7 @@ impl PlayerOverlay for NoOverlay {
 }
 
 /// Shared playback state
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SharedPlaybackState {
     pub volume: Arc<AtomicU16>,
     pub state: Arc<AtomicU8>,
@@ -46,6 +47,15 @@ pub struct SharedPlaybackState {
     pub mute: Arc<AtomicBool>,
     pub looping: Arc<AtomicBool>,
     pub pts: Arc<AtomicI64>,
+
+    // Current audio config
+    pub sample_rate: Arc<AtomicU32>,
+    pub channels: Arc<AtomicU8>,
+
+    // current playback streams
+    pub selected_video: Arc<AtomicIsize>,
+    pub selected_audio: Arc<AtomicIsize>,
+    pub selected_subtitle: Arc<AtomicIsize>,
 }
 
 /// Current state object from the player
@@ -427,11 +437,7 @@ impl Player {
     /// Get the currently playing video stream info
     fn current_video_stream(&self) -> Option<&StreamInfo> {
         if let Some(i) = self.stream_info.as_ref() {
-            let v_index = self
-                .media_player
-                .data
-                .selected_video
-                .load(Ordering::Relaxed);
+            let v_index = self.state.selected_video.load(Ordering::Relaxed);
             i.streams.iter().find(|s| s.index == v_index as _)
         } else {
             None
@@ -441,11 +447,7 @@ impl Player {
     /// Get the currently playing audio stream info
     fn current_audio_stream(&self) -> Option<&StreamInfo> {
         if let Some(i) = self.stream_info.as_ref() {
-            let v_index = self
-                .media_player
-                .data
-                .selected_audio
-                .load(Ordering::Relaxed);
+            let v_index = self.state.selected_audio.load(Ordering::Relaxed);
             i.streams.iter().find(|s| s.index == v_index as _)
         } else {
             None
@@ -455,11 +457,7 @@ impl Player {
     /// Get the currently playing subtitle stream info
     fn current_subtitle_stream(&self) -> Option<&StreamInfo> {
         if let Some(i) = self.stream_info.as_ref() {
-            let v_index = self
-                .media_player
-                .data
-                .selected_subtitle
-                .load(Ordering::Relaxed);
+            let v_index = self.state.selected_subtitle.load(Ordering::Relaxed);
             i.streams.iter().find(|s| s.index == v_index as _)
         } else {
             None
@@ -538,10 +536,15 @@ impl Player {
             mute: Arc::new(AtomicBool::new(false)),
             looping: Arc::new(AtomicBool::new(false)),
             pts: Arc::new(AtomicI64::new(0)),
+            sample_rate: Arc::new(AtomicU32::new(48_000)),
+            channels: Arc::new(AtomicU8::new(2)),
+            selected_video: Arc::new(AtomicIsize::new(-1)),
+            selected_audio: Arc::new(AtomicIsize::new(-1)),
+            selected_subtitle: Arc::new(AtomicIsize::new(-1)),
         };
 
         let (media_player, streams) =
-            MediaDecoder::new(input_path).expect("Failed to create media playback");
+            MediaDecoder::new(input_path, state.clone()).expect("Failed to create media playback");
 
         let audio = Self::open_audio(state.clone(), streams.audio)?;
 
@@ -612,7 +615,7 @@ impl Player {
             volume: self.state.volume.load(Ordering::Relaxed) as f32 / u16::MAX as f32,
             muted: self.state.mute.load(Ordering::Relaxed),
             playback_speed: self.state.speed.load(Ordering::Relaxed) as f32 / i16::MAX as f32,
-            looping: self.media_player.data.looping.load(Ordering::Relaxed),
+            looping: self.state.looping.load(Ordering::Relaxed),
             fullscreen: self.fullscreen,
             debug: self.debug,
         };
@@ -676,8 +679,7 @@ impl Player {
             self.show_osd(&format!("Seek: {}", s));
         }
         if let Some(s) = updates.set_looping {
-            self.state.looping
-                .store(s as _, Ordering::Relaxed);
+            self.state.looping.store(s as _, Ordering::Relaxed);
             self.show_osd(&format!("Looping: {}", s));
         }
         if let Some(s) = updates.set_fullscreen {

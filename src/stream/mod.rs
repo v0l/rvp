@@ -1,3 +1,4 @@
+use crate::SharedPlaybackState;
 use anyhow::Result;
 use anyhow::bail;
 use egui::ColorImage;
@@ -7,10 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
-#[cfg(feature = "ffmpeg")]
-mod ffmpeg;
 #[cfg(feature = "avfoundation")]
 mod avfoundation;
+#[cfg(feature = "ffmpeg")]
+mod ffmpeg;
 
 #[derive(Clone, Debug)]
 pub struct DecoderInfo {
@@ -89,7 +90,7 @@ pub struct VideoFrame {
 
 #[derive(Clone)]
 pub struct AudioSamples {
-    /// Raw audio samples, must be planar
+    /// Raw audio samples, must be planar, must match the playback rate in [SharedPlaybackState]
     pub data: Vec<Vec<f32>>,
     /// The stream index this frame belongs to
     pub stream_index: i32,
@@ -124,7 +125,7 @@ pub struct MediaDecoder {
     internal: Box<dyn MediaDecoderImpl + 'static>,
 
     /// Internal shared data
-    pub data: MediaDecoderThreadData,
+    data: MediaDecoderThreadData,
 }
 
 /// Data shared with the decoder thread including decoder controls
@@ -132,22 +133,13 @@ pub struct MediaDecoder {
 pub struct MediaDecoderThreadData {
     pub path: String,
 
-    pub looping: Arc<AtomicBool>,
-
-    // selected streams to decode and send data
-    pub selected_video: Arc<AtomicIsize>,
-    pub selected_audio: Arc<AtomicIsize>,
-    pub selected_subtitle: Arc<AtomicIsize>,
+    pub playback: SharedPlaybackState,
 
     // channels to send data back
     pub tx_m: SyncSender<DecoderInfo>,
     pub tx_v: SyncSender<VideoFrame>,
     pub tx_a: SyncSender<AudioSamples>,
     pub tx_s: SyncSender<SubtitlePacket>,
-
-    // audio resample format
-    pub sample_rate: Arc<AtomicU32>,
-    pub channels: Arc<AtomicU8>,
 }
 
 pub trait MediaDecoderImpl {
@@ -157,7 +149,7 @@ pub trait MediaDecoderImpl {
 
 impl MediaDecoder {
     /// Creates a new media player stream and returns the receiver channel
-    pub fn new(input: &str) -> Result<(Self, MediaStreams)> {
+    pub fn new(input: &str, state: SharedPlaybackState) -> Result<(Self, MediaStreams)> {
         let (tx_m, rx_m) = sync_channel(1);
         let (tx_v, rx_v) = sync_channel(10);
         let (tx_a, rx_a) = sync_channel(1_000);
@@ -165,16 +157,11 @@ impl MediaDecoder {
 
         let thread_data = MediaDecoderThreadData {
             path: input.to_string(),
-            looping: Arc::new(AtomicBool::new(false)),
-            selected_video: Arc::new(AtomicIsize::new(-1)),
-            selected_audio: Arc::new(AtomicIsize::new(-1)),
-            selected_subtitle: Arc::new(AtomicIsize::new(-1)),
+            playback: state,
             tx_m,
             tx_v,
             tx_a,
             tx_s,
-            sample_rate: Arc::new(AtomicU32::new(44_100)),
-            channels: Arc::new(AtomicU8::new(2)),
         };
         let mut internal = Self::create_decoder(thread_data.clone())?;
         let thread = internal.start()?;
