@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 use egui::{Color32, ColorImage, Vec2};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::{
     AV_NOPTS_VALUE, AVMediaType, AVPixelFormat, AVSampleFormat, av_get_pix_fmt_name,
-    av_get_sample_fmt_name, av_q2d, avcodec_get_name,
+    av_get_sample_fmt_name, av_q2d, av_sample_fmt_is_planar, avcodec_get_name,
 };
 use ffmpeg_rs_raw::{
     AvFrameRef, AvPacketRef, Decoder, Demuxer, DemuxerInfo, Resample, Scaler, StreamType,
@@ -148,13 +148,33 @@ impl DecoderThread {
         let frame = self.resample.process_frame(&frame)?;
         self.data.tx_a.send(AudioSamples {
             data: unsafe {
-                // TODO: check alignment
-                std::slice::from_raw_parts(
-                    frame.data[0] as *mut _,
-                    (frame.nb_samples * frame.ch_layout.nb_channels) as usize,
-                )
-            }
-            .to_vec(),
+                if av_sample_fmt_is_planar(FfmpegDecoder::OUT_SAMPLE_FORMAT) == 1 {
+                    frame
+                        .data
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(line, data)| {
+                            if data.is_null() {
+                                None
+                            } else {
+                                Some(
+                                    std::slice::from_raw_parts(
+                                        *data as *mut _,
+                                        frame.linesize[line] as _,
+                                    )
+                                    .to_vec(),
+                                )
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    std::slice::from_raw_parts(
+                        frame.extended_data as *const _,
+                        (frame.nb_samples * frame.ch_layout.nb_channels) as usize,
+                    )
+                    .to_vec()
+                }
+            },
             samples: frame.nb_samples as usize,
             stream_index,
             pts: if frame.pts != AV_NOPTS_VALUE {
@@ -281,6 +301,8 @@ pub(crate) struct FfmpegDecoder {
 }
 
 impl FfmpegDecoder {
+    const OUT_SAMPLE_FORMAT: AVSampleFormat = AVSampleFormat::AV_SAMPLE_FMT_FLTP;
+
     pub(crate) fn new(data: MediaDecoderThreadData) -> Self {
         Self { data }
     }
@@ -294,7 +316,7 @@ impl MediaDecoderImpl for FfmpegDecoder {
             decoder: Decoder::new(),
             scaler: Scaler::new(),
             resample: Resample::new(
-                AVSampleFormat::AV_SAMPLE_FMT_S32,
+                Self::OUT_SAMPLE_FORMAT,
                 self.data.sample_rate.load(Ordering::Relaxed),
                 self.data.channels.load(Ordering::Relaxed) as _,
             ),

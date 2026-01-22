@@ -89,8 +89,8 @@ pub struct VideoFrame {
 
 #[derive(Clone)]
 pub struct AudioSamples {
-    /// Raw audio samples
-    pub data: Vec<i32>,
+    /// Raw audio samples, must be planar
+    pub data: Vec<Vec<f32>>,
     /// The stream index this frame belongs to
     pub stream_index: i32,
     /// Presentation timestamp

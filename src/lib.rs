@@ -26,7 +26,11 @@ mod subtitle;
 
 /// Simple audio device handle
 pub trait AudioDevice: Send {
-    // no impl needed yet
+    /// Get the number of audio channels
+    fn channels(&self) -> u8;
+
+    /// Get the sample rate of the device
+    fn sample_rate(&self) -> u32;
 }
 
 /// A fallback device which just drains the audio stream
@@ -56,7 +60,15 @@ impl NoAudioDevice {
     }
 }
 
-impl AudioDevice for NoAudioDevice {}
+impl AudioDevice for NoAudioDevice {
+    fn channels(&self) -> u8 {
+        0
+    }
+
+    fn sample_rate(&self) -> u32 {
+        0
+    }
+}
 
 pub(crate) fn format_time(secs: f32) -> String {
     const MIN: f32 = 60.0;
