@@ -8,7 +8,7 @@ use objc2_av_foundation::AVURLAsset;
 use objc2_foundation::{NSString, NSURL};
 use std::thread::JoinHandle;
 
-/// Internal videotoolbox decoder thread instance
+/// Internal AVFoundation decoder thread instance
 struct DecoderThread {
     data: MediaDecoderThreadData,
     asset: Retained<AVURLAsset>,

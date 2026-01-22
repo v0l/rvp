@@ -10,7 +10,7 @@ authors = ["n00kii", "v0l"]
 rust-version = "1.88"
 
 [features]
-default = ["default-overlay", "cpal", "avfoundation"]
+default = ["default-overlay", "cpal", "ffmpeg"]
 audio = ["dep:bungee-sys"]
 cpal = ["audio", "dep:cpal"]
 ffmpeg = ["dep:ffmpeg-rs-raw"]
