@@ -17,21 +17,15 @@ use std::mem::transmute;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 
-fn video_frame_to_image(frame: &AvFrameRef) -> ColorImage {
-    let pixels: Vec<Color32> = match unsafe { transmute(frame.format) } {
-        AVPixelFormat::AV_PIX_FMT_RGB24 | AVPixelFormat::AV_PIX_FMT_RGBA => {
-            map_frame_to_pixels(frame)
-        }
-        _ => panic!("Pixel format not supported!"),
-    };
-    ColorImage {
+fn video_frame_to_image(frame: &AvFrameRef) -> Result<ColorImage> {
+    Ok(ColorImage {
         source_size: Vec2::new(frame.width as _, frame.height as _),
         size: [frame.width as _, frame.height as _],
-        pixels,
-    }
+        pixels: map_frame_to_pixels(frame)?,
+    })
 }
 
-fn map_frame_to_pixels(frame: &AvFrameRef) -> Vec<Color32> {
+fn map_frame_to_pixels(frame: &AvFrameRef) -> Result<Vec<Color32>> {
     let stride = frame.linesize[0] as usize;
     let lines = frame.height as usize;
     let w = (*frame).width as usize;
@@ -40,7 +34,7 @@ fn map_frame_to_pixels(frame: &AvFrameRef) -> Vec<Color32> {
     let bytes = match format {
         AVPixelFormat::AV_PIX_FMT_RGB24 | AVPixelFormat::AV_PIX_FMT_BGR24 => 3,
         AVPixelFormat::AV_PIX_FMT_RGBA | AVPixelFormat::AV_PIX_FMT_BGRA => 4,
-        _ => panic!("Pixel format not supported!"),
+        _ => bail!("Pixel format not supported!"),
     };
     let mut pixels = Vec::with_capacity(w * lines);
     for line in 0..lines {
@@ -66,7 +60,7 @@ fn map_frame_to_pixels(frame: &AvFrameRef) -> Vec<Color32> {
             pixels.extend(row);
         }
     }
-    pixels
+    Ok(pixels)
 }
 
 /// Internal FFMPEG decoder thread instance
@@ -134,7 +128,7 @@ impl DecoderThread {
             AVPixelFormat::AV_PIX_FMT_RGBA,
         )?;
         self.data.tx_v.send(VideoFrame {
-            data: video_frame_to_image(&new_frame),
+            data: video_frame_to_image(&new_frame)?,
             stream_index,
             pts: if frame.pts != AV_NOPTS_VALUE {
                 frame.pts as f64 * q
