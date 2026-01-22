@@ -196,7 +196,7 @@ impl MediaDecoder {
     #[allow(unused_variables)]
     fn create_decoder(data: MediaDecoderThreadData) -> Result<Box<dyn MediaDecoderImpl>> {
         #[cfg(feature = "ffmpeg")]
-        return Ok(Box::new(ffmpeg::FfmpegDecoderImpl::new(data)));
+        return Ok(Box::new(ffmpeg::FfmpegDecoder::new(data)));
         #[cfg(feature = "avfoundation")]
         return Ok(Box::new(avfoundation::AvFoundationDecoder::new(data)));
         bail!("No decoder impl available!")

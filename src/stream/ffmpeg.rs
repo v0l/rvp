@@ -34,26 +34,39 @@ fn video_frame_to_image(frame: &AvFrameRef) -> ColorImage {
 fn map_frame_to_pixels(frame: &AvFrameRef) -> Vec<Color32> {
     let stride = frame.linesize[0] as usize;
     let lines = frame.height as usize;
+    let w = (*frame).width as usize;
     let data = unsafe { std::slice::from_raw_parts_mut((*frame).data[0], stride * lines) };
-    let bytes = match unsafe { transmute((*frame).format) } {
-        AVPixelFormat::AV_PIX_FMT_RGB24 => 3,
-        AVPixelFormat::AV_PIX_FMT_RGBA => 4,
+    let format: AVPixelFormat = unsafe { transmute((*frame).format) };
+    let bytes = match format {
+        AVPixelFormat::AV_PIX_FMT_RGB24 | AVPixelFormat::AV_PIX_FMT_BGR24 => 3,
+        AVPixelFormat::AV_PIX_FMT_RGBA | AVPixelFormat::AV_PIX_FMT_BGRA => 4,
         _ => panic!("Pixel format not supported!"),
     };
-    (0..lines)
-        .map(|r| {
-            let offset = r * stride;
-            data[offset..offset + stride]
-                .chunks_exact(bytes)
-                .take((*frame).width as usize)
-                .map(|c| match bytes {
-                    3 => Color32::from_rgb(c[0], c[1], c[2]),
-                    4 => Color32::from_rgba_premultiplied(c[0], c[1], c[2], c[3]),
-                    _ => panic!("not possible"),
-                })
-        })
-        .flatten()
-        .collect()
+    let mut pixels = Vec::with_capacity(w * lines);
+    for line in 0..lines {
+        let offset = line * stride;
+        let line = &data[offset..offset + stride];
+        // fast path take entire line as slice
+        if format == AVPixelFormat::AV_PIX_FMT_RGBA {
+            let row =
+                unsafe { std::slice::from_raw_parts::<Color32>(line.as_ptr() as *const _, w) };
+            pixels.extend(row);
+        } else {
+            let row = line.chunks_exact(bytes).take(w).map(|c| match format {
+                AVPixelFormat::AV_PIX_FMT_RGB24 => Color32::from_rgb(c[0], c[1], c[2]),
+                AVPixelFormat::AV_PIX_FMT_BGR24 => Color32::from_rgb(c[2], c[1], c[0]),
+                AVPixelFormat::AV_PIX_FMT_RGBA => {
+                    Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
+                }
+                AVPixelFormat::AV_PIX_FMT_BGRA => {
+                    Color32::from_rgba_unmultiplied(c[2], c[1], c[0], c[3])
+                }
+                _ => panic!("not possible"),
+            });
+            pixels.extend(row);
+        }
+    }
+    pixels
 }
 
 /// Internal FFMPEG decoder thread instance
@@ -269,17 +282,17 @@ impl DecoderThread {
     }
 }
 
-pub(crate) struct FfmpegDecoderImpl {
+pub(crate) struct FfmpegDecoder {
     data: MediaDecoderThreadData,
 }
 
-impl FfmpegDecoderImpl {
+impl FfmpegDecoder {
     pub(crate) fn new(data: MediaDecoderThreadData) -> Self {
         Self { data }
     }
 }
 
-impl MediaDecoderImpl for FfmpegDecoderImpl {
+impl MediaDecoderImpl for FfmpegDecoder {
     fn start(&mut self) -> Result<JoinHandle<()>> {
         let mut instance = DecoderThread {
             data: self.data.clone(),
