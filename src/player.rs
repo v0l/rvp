@@ -3,7 +3,7 @@ use crate::stream::{
 };
 #[cfg(feature = "subtitles")]
 use crate::subtitle::Subtitle;
-use crate::{AudioDevice, NoAudioDevice, format_time};
+use crate::{AudioDevice, NoAudioDevice, SharedPlaybackState, format_time};
 use anyhow::Result;
 use egui::load::SizedTexture;
 use egui::text::LayoutJob;
@@ -16,7 +16,7 @@ use std::fmt::Display;
 use std::ops::Add;
 use std::sync::Arc;
 use std::sync::atomic::{
-    AtomicBool, AtomicI8, AtomicI16, AtomicI64, AtomicIsize, AtomicU8, AtomicU16, AtomicU32,
+    AtomicBool, AtomicI8, AtomicI64, AtomicIsize, AtomicU8, AtomicU16, AtomicU32, AtomicU64,
     Ordering,
 };
 use std::sync::mpsc::Receiver;
@@ -28,82 +28,13 @@ struct Subtitle;
 /// Generic overlay for player controls
 pub trait PlayerOverlay: Send {
     /// Show the overlay
-    fn show(&self, ui: &mut Ui, frame_response: &Response, p: &PlaybackInfo) -> PlaybackUpdate;
+    fn show(&self, ui: &mut Ui, frame_response: &Response, p: &SharedPlaybackState);
 }
 
 struct NoOverlay;
 impl PlayerOverlay for NoOverlay {
-    fn show(&self, _ui: &mut Ui, _frame_response: &Response, _p: &PlaybackInfo) -> PlaybackUpdate {
-        PlaybackUpdate::default()
-    }
-}
-
-/// Shared playback state
-#[derive(Clone, Debug)]
-pub struct SharedPlaybackState {
-    pub volume: Arc<AtomicU16>,
-    pub state: Arc<AtomicU8>,
-    pub speed: Arc<AtomicI8>,
-    pub mute: Arc<AtomicBool>,
-    pub looping: Arc<AtomicBool>,
-    pub pts: Arc<AtomicI64>,
-
-    // Current audio config
-    pub sample_rate: Arc<AtomicU32>,
-    pub channels: Arc<AtomicU8>,
-
-    // current playback streams
-    pub selected_video: Arc<AtomicIsize>,
-    pub selected_audio: Arc<AtomicIsize>,
-    pub selected_subtitle: Arc<AtomicIsize>,
-}
-
-/// Current state object from the player
-#[derive(Debug, Clone)]
-pub struct PlaybackInfo {
-    pub state: PlayerState,
-    pub duration: f32,
-    pub elapsed: f32,
-    pub volume: f32,
-    pub muted: bool,
-    pub playback_speed: f32,
-    pub looping: bool,
-    pub fullscreen: bool,
-    pub debug: bool,
-}
-
-/// Requested change in player state
-#[derive(Debug, Clone, Default)]
-pub struct PlaybackUpdate {
-    /// Set the player state
-    pub set_state: Option<PlayerState>,
-    /// Set the playback volume
-    pub set_volume: Option<f32>,
-    /// Seek to playback position as a percentage of the duration of the media ??
-    pub set_seek: Option<f32>,
-    /// Set the audio to muted
-    pub set_muted: Option<bool>,
-    /// Set the playback speed
-    pub set_playback_speed: Option<f32>,
-    /// Set playback to loop
-    pub set_looping: Option<bool>,
-    /// Set player fullscreen mode
-    pub set_fullscreen: Option<bool>,
-    /// Set debug information display
-    pub set_debug: Option<bool>,
-}
-
-impl PlaybackUpdate {
-    /// True if any state changes are requested
-    pub fn any(&self) -> bool {
-        self.set_state.is_some()
-            || self.set_volume.is_some()
-            || self.set_seek.is_some()
-            || self.set_muted.is_some()
-            || self.set_playback_speed.is_some()
-            || self.set_looping.is_some()
-            || self.set_fullscreen.is_some()
-            || self.set_debug.is_some()
+    fn show(&self, _ui: &mut Ui, _frame_response: &Response, _p: &SharedPlaybackState) {
+        // noop
     }
 }
 
@@ -123,8 +54,8 @@ pub struct Player {
     frame: TextureHandle,
     /// Start presentation time for the current frame
     frame_pts: f64,
-    /// End presentation timestamp for the current frame
-    frame_pts_end: f64,
+    /// Length to show this frame in seconds
+    frame_duration: f64,
     /// Clock time when the frame began
     frame_instant: Instant,
 
@@ -206,30 +137,37 @@ impl Player {
         );
         self.frame.set(frame.data, TextureOptions::default());
         self.frame_pts = frame.pts;
-        self.frame_pts_end = frame.pts + frame.duration;
+        self.frame_duration = frame.duration;
         self.frame_counter += 1;
         self.frame_instant = Instant::now();
+        self.state.set_video_pts(frame.pts);
+
+        // apply playback speed by adjusting frame duration
+        let speed = self.state.speed() as f64 / 1.0;
+        //self.frame_duration *= speed;
+
+        // tweak duration for A/V sync
+        let diff = self.state.video_pts() - self.state.audio_pts();
+        let max_diff = self.frame_duration * 0.1;
+        //self.frame_duration += diff.clamp(-max_diff, max_diff);
     }
 
     fn request_repaint_for_next_frame(&self) {
         let now = Instant::now();
-        let frame_duration = self.frame_pts_end - self.frame_pts;
         let next_frame = self
             .frame_instant
-            .add(Duration::from_secs_f64(frame_duration));
+            .add(Duration::from_secs_f64(self.frame_duration));
         if now > next_frame {
-            trace!("request repaint now!");
             self.ctx.request_repaint();
         } else {
             let tt_nf = next_frame - now;
-            trace!("request repaint for {}ms", tt_nf.as_millis());
             self.ctx.request_repaint_after(tt_nf);
         }
     }
 
     /// Check if the current frame should be flipped
     fn check_load_frame(&mut self) -> bool {
-        if self.state.state.load(Ordering::Relaxed) == PlayerState::Paused as u8 {
+        if self.state.state() == PlayerState::Paused {
             // force frame to start now, while paused
             self.frame_instant = Instant::now();
             return false;
@@ -239,14 +177,10 @@ impl Player {
         now >= self.frame_end_instant()
     }
 
-    /// Duration of the current frame
-    fn frame_duration(&self) -> Duration {
-        Duration::from_secs_f64(self.frame_pts_end - self.frame_pts)
-    }
-
     /// Instant when the current frame ends
     fn frame_end_instant(&self) -> Instant {
-        self.frame_instant.add(self.frame_duration())
+        self.frame_instant
+            .add(Duration::from_secs_f64(self.frame_duration))
     }
 
     /// Enable/Disable built-in keybind controls
@@ -255,54 +189,52 @@ impl Player {
     }
 
     /// Handle key input
-    fn handle_keys(&mut self, ui: &mut Ui, state: &PlaybackInfo) -> PlaybackUpdate {
+    fn handle_keys(&mut self, ui: &mut Ui) {
         const SEEK_STEP: f32 = 5.0;
-        const VOLUME_STEP: f32 = 0.1;
+        const VOLUME_STEP: f32 = 0.01;
         const SPEED_STEP: f32 = 0.1;
 
         if !self.key_binds {
-            return PlaybackUpdate::default();
+            return;
         }
 
-        let mut p_ret = PlaybackUpdate::default();
         ui.input(|inputs| {
             for e in &inputs.events {
                 match e {
                     Event::Key { key, pressed, .. } if *pressed => match key {
                         Key::Space => {
-                            if state.state == PlayerState::Playing {
-                                p_ret.set_state.replace(PlayerState::Paused);
+                            if self.state.state() == PlayerState::Playing {
+                                self.state.set_state(PlayerState::Paused);
                             } else {
-                                p_ret.set_state.replace(PlayerState::Playing);
+                                self.state.set_state(PlayerState::Playing);
                             }
                         }
                         Key::OpenBracket => {
-                            p_ret
-                                .set_playback_speed
-                                .replace(state.playback_speed - SPEED_STEP);
+                            self.state.decr_speed(SPEED_STEP);
                         }
                         Key::CloseBracket => {
-                            p_ret
-                                .set_playback_speed
-                                .replace(state.playback_speed + SPEED_STEP);
+                            self.state.incr_speed(SPEED_STEP);
                         }
                         Key::ArrowRight => {
-                            p_ret.set_seek.replace(state.elapsed + SEEK_STEP);
+                            // not implemented
                         }
                         Key::ArrowLeft => {
-                            p_ret.set_seek.replace(state.elapsed - SEEK_STEP);
+                            // not implemented
                         }
                         Key::ArrowUp => {
-                            p_ret.set_volume.replace(state.volume + VOLUME_STEP);
+                            self.state.incr_volume(VOLUME_STEP);
                         }
                         Key::ArrowDown => {
-                            p_ret.set_volume.replace(state.volume - VOLUME_STEP);
+                            self.state.decr_volume(VOLUME_STEP);
                         }
                         Key::F => {
-                            p_ret.set_fullscreen.replace(!state.fullscreen);
+                            self.fullscreen = !self.fullscreen;
                         }
                         Key::F1 => {
-                            p_ret.set_debug.replace(!state.debug);
+                            self.debug = !self.debug;
+                        }
+                        Key::M => {
+                            self.state.set_muted(!self.state.muted());
                         }
                         _ => {}
                     },
@@ -310,19 +242,17 @@ impl Player {
                 }
             }
         });
-        p_ret
     }
 
     fn process_state(&mut self) {
-        let current_state = PlayerState::from(self.state.state.load(Ordering::Relaxed));
+        let current_state = self.state.state();
         if self.stream_info.is_none()
             && let Ok(md) = self.rx_metadata.try_recv()
         {
+            self.state.set_duration(md.duration as _);
             self.stream_info.replace(md);
             if current_state != PlayerState::Playing {
-                self.state
-                    .state
-                    .store(PlayerState::Playing as _, Ordering::Relaxed);
+                self.state.set_state(PlayerState::Playing);
             }
         }
 
@@ -330,12 +260,6 @@ impl Player {
             // nothing to do, playback is stopped
             return;
         }
-
-        //self.media_player.set_target_size(size);
-        let duration_since_frame_start = self.frame_instant.elapsed().as_secs_f64();
-        let current_pts = self.frame_pts + duration_since_frame_start;
-        let current_pts = (current_pts * 1000.0) as _;
-        self.state.pts.store(current_pts, Ordering::Relaxed);
 
         // check if we should load the next video frame
         if !self.check_load_frame() {
@@ -414,12 +338,12 @@ impl Player {
         }
     }
 
-    fn render_debug(&mut self, ui: &mut Ui, frame_response: &Response, p: &PlaybackInfo) {
+    fn render_debug(&mut self, ui: &mut Ui, frame_response: &Response) {
         let painter = ui.painter();
 
         const PADDING: f32 = 5.0;
         let vec_padding = vec2(PADDING, PADDING);
-        let job = self.debug_inner(frame_response.rect, p);
+        let job = self.debug_inner(frame_response.rect);
         let galley = painter.layout_job(job);
         let mut bg_pos = galley
             .rect
@@ -464,21 +388,23 @@ impl Player {
         }
     }
 
-    fn debug_inner(&mut self, frame_response: Rect, p: &PlaybackInfo) -> LayoutJob {
+    fn debug_inner(&mut self, frame_response: Rect) -> LayoutJob {
         let font = TextFormat::simple(FontId::monospace(11.), Color32::WHITE);
 
         let mut layout = LayoutJob::default();
-        // layout.append(
-        //     &format!(
-        //         "sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s, buffer: {:.3}s",
-        //         v_pts,
-        //         a_pts,
-        //         a_pts - v_pts,
-        //         buffer
-        //     ),
-        //     0.0,
-        //     font.clone(),
-        // );
+        let v_pts = self.state.video_pts();
+        let a_pts = self.state.audio_pts();
+
+        layout.append(
+            &format!(
+                "sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s",
+                v_pts,
+                a_pts,
+                a_pts - v_pts,
+            ),
+            0.0,
+            font.clone(),
+        );
 
         let video_stream = self.current_video_stream();
         let video_size = self.video_frame_size(frame_response);
@@ -487,7 +413,7 @@ impl Player {
                 "\nplayback: {:.2} fps ({:.2}x), volume={:.0}%, resolution={}x{}",
                 self.avg_fps,
                 self.avg_fps / video_stream.map(|s| s.fps).unwrap_or(1.0),
-                100.0 * p.volume,
+                100.0 * (self.state.volume()),
                 video_size.x,
                 video_size.y
             ),
@@ -529,19 +455,7 @@ impl Player {
 
     /// Create a new [`Player`].
     pub fn new(ctx: &egui::Context, input_path: &str) -> Result<Self> {
-        let state = SharedPlaybackState {
-            state: Arc::new(AtomicU8::new(PlayerState::Stopped as _)),
-            volume: Arc::new(AtomicU16::new(u16::MAX)),
-            speed: Arc::new(AtomicI8::new(100)),
-            mute: Arc::new(AtomicBool::new(false)),
-            looping: Arc::new(AtomicBool::new(false)),
-            pts: Arc::new(AtomicI64::new(0)),
-            sample_rate: Arc::new(AtomicU32::new(48_000)),
-            channels: Arc::new(AtomicU8::new(2)),
-            selected_video: Arc::new(AtomicIsize::new(-1)),
-            selected_audio: Arc::new(AtomicIsize::new(-1)),
-            selected_subtitle: Arc::new(AtomicIsize::new(-1)),
-        };
+        let state = SharedPlaybackState::new();
 
         let (media_player, streams) =
             MediaDecoder::new(input_path, state.clone()).expect("Failed to create media playback");
@@ -564,7 +478,7 @@ impl Player {
             ),
             frame_instant: Instant::now(),
             frame_pts: 0.0,
-            frame_pts_end: 0.0,
+            frame_duration: 0.0,
             ctx: ctx.clone(),
             audio,
             subtitle: None,
@@ -608,23 +522,11 @@ impl Player {
     pub fn render(&mut self, ui: &mut Ui) -> Response {
         let size = ui.available_size();
 
-        let state = PlaybackInfo {
-            state: self.state.state.load(Ordering::Relaxed).into(),
-            duration: self.stream_info.as_ref().map(|i| i.duration).unwrap_or(0.0),
-            elapsed: (self.state.pts.load(Ordering::Relaxed) as f64 / 1000.0) as _,
-            volume: self.state.volume.load(Ordering::Relaxed) as f32 / u16::MAX as f32,
-            muted: self.state.mute.load(Ordering::Relaxed),
-            playback_speed: self.state.speed.load(Ordering::Relaxed) as f32 / i16::MAX as f32,
-            looping: self.state.looping.load(Ordering::Relaxed),
-            fullscreen: self.fullscreen,
-            debug: self.debug,
-        };
-        let upd = self.handle_keys(ui, &state);
-        self.process_update(upd);
+        self.handle_keys(ui);
         self.process_state();
         let frame_response = self.render_frame(ui);
         self.render_subtitles(ui);
-        self.render_overlay(ui, &frame_response, &state);
+        self.render_overlay(ui, &frame_response);
         if let Some(error) = &self.error {
             ui.painter().text(
                 pos2(size.x / 2.0, size.y / 2.0),
@@ -647,55 +549,13 @@ impl Player {
             );
         }
         if self.debug {
-            self.render_debug(ui, &frame_response, &state);
+            self.render_debug(ui, &frame_response);
         }
         frame_response
     }
 
-    fn process_update(&mut self, updates: PlaybackUpdate) {
-        // TODO: change internal state
-        if updates.any() {
-            info!("State change: {:?}", updates);
-        }
-
-        if let Some(s) = updates.set_state {
-            self.state.state.store(s as _, Ordering::Relaxed);
-            self.show_osd(&s.to_string())
-        }
-        if let Some(s) = updates.set_volume {
-            self.state.volume.store(s as _, Ordering::Relaxed);
-            self.show_osd(&format!("Volume: {}", s));
-        }
-        if let Some(s) = updates.set_muted {
-            self.state.mute.store(s as _, Ordering::Relaxed);
-            self.show_osd(&format!("Muted: {}", s));
-        }
-        if let Some(s) = updates.set_playback_speed {
-            self.state.speed.store(s as _, Ordering::Relaxed);
-            self.show_osd(&format!("Speed: {}", s));
-        }
-        if let Some(s) = updates.set_seek {
-            // TODO: make seeking
-            self.show_osd(&format!("Seek: {}", s));
-        }
-        if let Some(s) = updates.set_looping {
-            self.state.looping.store(s as _, Ordering::Relaxed);
-            self.show_osd(&format!("Looping: {}", s));
-        }
-        if let Some(s) = updates.set_fullscreen {
-            self.fullscreen = s;
-            // TODO: make fullscreen
-            self.show_osd(&format!("Fullscreen: {}", s));
-        }
-        if let Some(s) = updates.set_debug {
-            self.debug = s;
-            self.show_osd(&format!("Debug: {}", s));
-        }
-    }
-
-    fn render_overlay(&mut self, ui: &mut Ui, frame: &Response, state: &PlaybackInfo) {
-        let upd = self.overlay.show(ui, frame, state);
-        self.process_update(upd);
+    fn render_overlay(&mut self, ui: &mut Ui, frame: &Response) {
+        self.overlay.show(ui, frame, &self.state);
     }
 }
 

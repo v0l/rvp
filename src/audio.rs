@@ -1,19 +1,20 @@
 use crate::stream::AudioSamples;
 use crate::{PlayerState, SharedPlaybackState};
-use anyhow::Result;
 use anyhow::bail;
-use bungee_sys::BungeeStream;
+use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream, StreamConfig};
-use log::{error, info, trace};
+use cpal::{SampleFormat, Stream, StreamConfig, StreamInstant};
+use log::{error, info};
+use scaletempo2::{
+    mp_scaletempo2, mp_scaletempo2_create, mp_scaletempo2_fill_input_buffer,
+    mp_scaletempo2_get_default_opts,
+};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
-use std::pin::pin;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU16, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, mpsc};
-use std::thread::sleep;
 use std::time::Duration;
 
 /// The playback device. Needs to be initialized (and kept alive!) for use by a [`Player`].
@@ -68,7 +69,6 @@ impl AudioDevice {
             cfg.sample_rate(),
             cfg.channels(),
             cfg.sample_format(),
-
         );
 
         let channels = cfg.channels() as u8;
@@ -83,59 +83,49 @@ impl AudioDevice {
         for _ in 0..channels {
             simple_queue.push(VecDeque::new());
         }
-        let mut queue_head_pts = 0.0;
-        let mut bungee_stream = BungeeWrapper::new(channels, sample_rate, sample_rate)?;
+        let mut audio_scale = AudioScale::new(channels, sample_rate).expect("audio scale");
         let stream = device.0.build_output_stream_raw(
             &cfg.config(),
             SampleFormat::F32,
-            move |data: &mut cpal::Data, _info: &cpal::OutputCallbackInfo| {
+            move |data: &mut cpal::Data, info: &cpal::OutputCallbackInfo| {
                 if data.len() == 0 {
                     return;
                 }
                 let dst: &mut [f32] = data.as_slice_mut().unwrap();
                 dst.fill(0.0);
-                let state = p.state.load(Ordering::Relaxed);
-                if state == PlayerState::Stopped as u8 || state == PlayerState::Paused as u8 {
+                let state = p.state();
+                if state == PlayerState::Stopped || state == PlayerState::Paused {
                     return;
                 }
-                let current_pts = p.pts.load(Ordering::Relaxed) as f64 / 1000.0;
+                // number of samples per channel to drain
+                let stride = dst.len() / channels as usize;
 
-                /// number of samples to stretch to move towards pts target (per channel)
-                const NUDGE_SAMPLES: usize = 128;
+                if stride == 0 {
+                    panic!("Nothing to drain");
+                }
 
-                let nudge_drift = NUDGE_SAMPLES as f64 / sample_rate as f64;
-                let pts_drift = queue_head_pts - current_pts;
-                let drain_samples = if pts_drift < nudge_drift {
-                    // drain more samples for the input side
-                    dst.len() + NUDGE_SAMPLES
-                } else {
-                    dst.len() - NUDGE_SAMPLES
-                };
-
-                let mut empty_loop = 0;
                 // fill queue until dst is satisfied
-                while simple_queue[0].len() < drain_samples {
+                while simple_queue[0].len() < stride {
                     // take samples from channel
                     match rx.try_recv() {
                         Ok(m) => {
                             // for the first frame set the queue head pts
                             if !first_frame {
                                 first_frame = true;
-                                queue_head_pts = m.pts;
+                                let buffer_delay = info
+                                    .timestamp()
+                                    .playback
+                                    .duration_since(&info.timestamp().callback)
+                                    .unwrap_or(Duration::ZERO)
+                                    .as_secs_f64();
+                                info!("First audio frame pts={}, delay={}", m.pts, buffer_delay);
+                                p.incr_audio_pts(buffer_delay);
                             }
                             for (chan, data) in m.data.into_iter().enumerate() {
                                 simple_queue[chan].extend(data);
                             }
                         }
                         Err(mpsc::TryRecvError::Empty) => {
-                            // max wait 50ms
-                            if empty_loop > 10 {
-                                error!("Audio underrun!");
-                                return;
-                            }
-                            trace!("Audio underrun!");
-                            empty_loop += 1;
-                            sleep(Duration::from_millis(5));
                             continue;
                         }
                         Err(_) => {
@@ -143,34 +133,45 @@ impl AudioDevice {
                         }
                     }
                 }
-                let in_samples = simple_queue
+                let mut in_samples = simple_queue
                     .iter_mut()
-                    .map(|r| r.drain(..drain_samples).collect::<Vec<_>>())
+                    .map(|r| r.drain(..stride).collect::<Vec<_>>())
                     .collect::<Vec<_>>();
 
-                let out_samples_len = dst.len() / channels as usize;
-                let mut out_samples = Vec::with_capacity(channels as usize);
-                out_samples.resize_with(channels as _, || {
-                    let mut v_line = Vec::with_capacity(out_samples_len);
-                    v_line.resize(out_samples_len, 0.0);
-                    v_line
-                });
+                // move queue head pts
+                let drain_samples_pts = stride as f64 / sample_rate as f64;
+                p.incr_audio_pts(drain_samples_pts);
 
-                if let Err(e) = bungee_stream.process(
-                    in_samples,
-                    drain_samples,
-                    &mut out_samples,
-                    out_samples_len,
-                ) {
-                    panic!("Error processing audio data: {}", e);
+                // after draining all the samples, drop them
+                if p.muted() {
+                    return;
                 }
 
-                // move queue head pts
-                let head_drain = out_samples_len as f64 / sample_rate as f64;
-                queue_head_pts += head_drain;
+                let speed = p.speed();
+                let volume = p.volume();
+                if speed != 1.0 {
+                    let dst_samples = dst.len() / channels as usize;
+                    // create a buffer to hold the output samples
+                    // device samples are always packed
+                    let mut out_samples = Vec::with_capacity(channels as usize);
+                    out_samples.resize_with(channels as _, || {
+                        let mut v_line = Vec::with_capacity(dst_samples);
+                        v_line.resize(dst_samples, 0.0);
+                        v_line
+                    });
+
+                    todo!();
+                } else {
+                    let chans = in_samples.len();
+                    for (x, chan) in in_samples.iter_mut().enumerate() {
+                        for z in 0..stride {
+                            dst[x + (chans * z)] = chan[z] * volume;
+                        }
+                    }
+                }
             },
             move |e| {
-                panic!("{}", e);
+                error!("{}", e);
             },
             None,
         )?;
@@ -183,59 +184,41 @@ impl AudioDevice {
     }
 }
 
-struct BungeeWrapper {
-    ctx: NonNull<BungeeStream>,
-    _marker: PhantomData<BungeeStream>,
+struct AudioScale {
+    ctx: NonNull<mp_scaletempo2>,
+    _m: PhantomData<mp_scaletempo2>,
 }
 
-unsafe impl Send for BungeeWrapper {}
-
-impl BungeeWrapper {
-    pub fn new(channels: u8, in_rate: u32, out_rate: u32) -> Result<BungeeWrapper> {
-        let ctx = {
-            let samples = bungee_sys::SampleRates {
-                input: in_rate as _,
-                output: out_rate as _,
-            };
-            let stretcher = bungee_sys::stretcher::create(samples, channels as _, 2);
-            if stretcher.is_null() {
-                bail!("Failed to create stretcher");
-            }
-            let ctx = bungee_sys::stream::create(stretcher, channels as _, 8192);
+impl AudioScale {
+    pub fn new(channels: u8, sample_rate: u32) -> Result<AudioScale> {
+        unsafe {
+            let opts = mp_scaletempo2_get_default_opts();
+            let ctx = mp_scaletempo2_create(&opts, channels as _, sample_rate as _);
             if ctx.is_null() {
-                bail!("Failed to create stretcher stream");
+                bail!("Failed to create default audio device");
             }
-            ctx
-        };
-        Ok(Self {
-            ctx: NonNull::new(ctx).unwrap(),
-            _marker: PhantomData,
-        })
+            Ok(Self {
+                ctx: NonNull::new(ctx).context("failed to create audio device")?,
+                _m: PhantomData,
+            })
+        }
     }
 
     pub fn process(
         &mut self,
-        in_data: Vec<Vec<f32>>,
-        in_samples: usize,
-        out_data: &mut Vec<Vec<f32>>,
-        out_samples: usize,
-    ) -> Result<()> {
-        let mut ptr_in = Vec::new();
-        for line in in_data.iter() {
-            ptr_in.push(std::ptr::addr_of!(line));
+        in_samples: Vec<Vec<f32>>,
+        in_size: usize,
+        out_samples: Vec<Vec<f32>>,
+        speed: f64,
+    ) {
+        let mut in_ptrs = in_samples.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+        unsafe {
+            let proc_samples = mp_scaletempo2_fill_input_buffer(
+                self.ctx.as_mut(),
+                in_ptrs.as_mut_ptr() as _,
+                in_size as _,
+                speed,
+            );
         }
-        let mut ptr_out = Vec::new();
-        for mut line in out_data.into_iter() {
-            ptr_out.push(std::ptr::addr_of_mut!(line));
-        }
-        bungee_sys::stream::process(
-            self.ctx.as_ptr(),
-            ptr_in.as_ptr() as _,
-            ptr_out.as_mut_ptr() as _,
-            in_samples as _,
-            out_samples as _,
-            1.0,
-        );
-        Ok(())
     }
 }

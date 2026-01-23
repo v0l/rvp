@@ -11,6 +11,11 @@ mod audio;
 
 #[cfg(feature = "audio")]
 pub use audio::*;
+use std::sync::Arc;
+use std::sync::atomic::{
+    AtomicBool, AtomicI8, AtomicI64, AtomicIsize, AtomicU8, AtomicU16, AtomicU32, AtomicU64,
+    Ordering,
+};
 
 #[cfg(feature = "hls")]
 mod hls;
@@ -20,9 +25,11 @@ mod overlay;
 pub use overlay::*;
 mod player;
 pub use player::*;
+mod state;
 mod stream;
 #[cfg(feature = "subtitles")]
 mod subtitle;
+pub use state::*;
 
 /// Simple audio device handle
 pub trait AudioDevice: Send {

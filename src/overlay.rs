@@ -1,5 +1,5 @@
 use crate::stream::StreamType;
-use crate::{PlaybackInfo, PlaybackUpdate, PlayerOverlay, PlayerState, format_time};
+use crate::{PlayerOverlay, PlayerState, SharedPlaybackState, format_time};
 use egui::{
     Align2, Color32, CornerRadius, FontId, Rect, Response, Sense, Shadow, Spinner, Ui, Vec2, vec2,
 };
@@ -8,11 +8,12 @@ use egui::{
 pub struct DefaultOverlay;
 
 impl PlayerOverlay for DefaultOverlay {
-    fn show(&self, ui: &mut Ui, frame_response: &Response, p: &PlaybackInfo) -> PlaybackUpdate {
+    fn show(&self, ui: &mut Ui, frame_response: &Response, p: &SharedPlaybackState) {
         let hovered = ui.rect_contains_pointer(frame_response.rect);
-        let currently_seeking = matches!(p.state, PlayerState::Seeking);
-        let is_stopped = matches!(p.state, PlayerState::Stopped);
-        let is_paused = matches!(p.state, PlayerState::Paused);
+        let state = p.state();
+        let currently_seeking = matches!(state, PlayerState::Seeking);
+        let is_stopped = matches!(state, PlayerState::Stopped);
+        let is_paused = matches!(state, PlayerState::Paused);
         let animation_time = 0.2;
         let seekbar_anim_frac = ui.ctx().animate_bool_with_time(
             frame_response.id.with("seekbar_anim"),
@@ -21,15 +22,15 @@ impl PlayerOverlay for DefaultOverlay {
         );
 
         if seekbar_anim_frac <= 0. {
-            return PlaybackUpdate::default();
+            return;
         }
 
         let seekbar_width_offset = 20.;
         let fullseekbar_width = frame_response.rect.width() - seekbar_width_offset;
 
         let seekbar_width = fullseekbar_width
-            * if p.duration != 0.0 {
-                (p.elapsed / p.duration).max(1.0)
+            * if p.duration() != 0.0 {
+                (p.video_pts() / p.duration()).max(1.0) as _
             } else {
                 0.0
             };
@@ -86,7 +87,6 @@ impl PlayerOverlay for DefaultOverlay {
             );
         }
 
-        let mut p_ret = PlaybackUpdate::default();
         if seekbar_hovered || currently_seeking {
             if let Some(hover_pos) = seekbar_response.hover_pos() {
                 if seekbar_response.clicked() || seekbar_response.dragged() {
@@ -102,14 +102,14 @@ impl PlayerOverlay for DefaultOverlay {
                             .max(fullseekbar_rect.left()),
                     );
                     if is_stopped {
-                        p_ret.set_state.replace(PlayerState::Playing);
+                        p.set_state(PlayerState::Playing);
                     }
-                    p_ret.set_seek.replace(seek_frac);
+                    //p_ret.set_seek.replace(seek_frac);
                 }
             }
         }
         let text_color = Color32::WHITE.linear_multiply(seekbar_anim_frac);
-
+        let volume = p.volume();
         let pause_icon = if is_paused {
             "▶"
         } else if is_stopped {
@@ -119,11 +119,11 @@ impl PlayerOverlay for DefaultOverlay {
         } else {
             "⏸"
         };
-        let sound_icon = if p.volume > 0.7 {
+        let sound_icon = if volume > 0.7 {
             "🔊"
-        } else if p.volume > 0.4 {
+        } else if volume > 0.4 {
             "🔉"
-        } else if p.volume > 0. {
+        } else if volume > 0. {
             "🔈"
         } else {
             "🔇"
@@ -182,14 +182,18 @@ impl PlayerOverlay for DefaultOverlay {
             text_color,
         );
 
-        if p.elapsed.is_finite() {
+        if p.video_pts().is_finite() {
             ui.painter().text(
                 duration_text_pos,
                 Align2::LEFT_BOTTOM,
-                if p.duration > 0.0 {
-                    format!("{} / {}", format_time(p.elapsed), format_time(p.duration))
+                if p.duration() > 0.0 {
+                    format!(
+                        "{} / {}",
+                        format_time(p.video_pts() as _),
+                        format_time(p.duration() as _)
+                    )
                 } else {
-                    format_time(p.elapsed)
+                    format_time(p.video_pts() as _)
                 },
                 duration_text_font_id,
                 text_color,
@@ -205,12 +209,12 @@ impl PlayerOverlay for DefaultOverlay {
         }
 
         if frame_response.clicked() {
-            match p.state {
+            match p.state() {
                 PlayerState::Stopped | PlayerState::Paused => {
-                    p_ret.set_state.replace(PlayerState::Playing);
+                    p.set_state(PlayerState::Playing);
                 }
                 PlayerState::Playing | PlayerState::Seeking => {
-                    p_ret.set_state.replace(PlayerState::Paused);
+                    p.set_state(PlayerState::Paused);
                 }
                 _ => {}
             }
@@ -318,10 +322,10 @@ impl PlayerOverlay for DefaultOverlay {
             )
             .clicked()
         {
-            if p.muted {
-                p_ret.set_muted.replace(false);
+            if p.muted() {
+                p.set_muted(false);
             } else {
-                p_ret.set_muted.replace(true);
+                p.set_muted(true);
             }
         }
 
@@ -350,7 +354,7 @@ impl PlayerOverlay for DefaultOverlay {
         let sound_bar_color =
             Color32::from_white_alpha(contraster_alpha).linear_multiply(sound_anim_frac);
         let mut sound_bar_rect = sound_slider_rect;
-        sound_bar_rect.set_top(sound_bar_rect.bottom() - (sound_bar_rect.height() * p.volume));
+        sound_bar_rect.set_top(sound_bar_rect.bottom() - (sound_bar_rect.height() * volume));
 
         ui.painter().rect_filled(
             sound_slider_rect,
@@ -369,11 +373,9 @@ impl PlayerOverlay for DefaultOverlay {
             if let Some(hover_pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
                 let sound_frac = 1.
                     - ((hover_pos - sound_slider_rect.left_top()).y / sound_slider_rect.height())
-                        .max(0.)
-                        .min(1.);
-                p_ret.set_volume.replace(sound_frac);
+                        .clamp(0.0, 1.0);
+                p.set_volume(sound_frac);
             }
         }
-        p_ret
     }
 }

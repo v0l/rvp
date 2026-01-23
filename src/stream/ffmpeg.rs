@@ -5,14 +5,15 @@ use crate::stream::{
 use anyhow::{Result, bail};
 use egui::{Color32, ColorImage, Vec2};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::{
-    AV_NOPTS_VALUE, AVMediaType, AVPixelFormat, AVSampleFormat, av_get_pix_fmt_name,
-    av_get_sample_fmt_name, av_q2d, av_sample_fmt_is_planar, avcodec_get_name,
+    AV_NOPTS_VALUE, AVMediaType, AVPixelFormat, AVSampleFormat, av_get_bytes_per_sample,
+    av_get_pix_fmt_name, av_get_sample_fmt_name, av_q2d, avcodec_get_name,
 };
 use ffmpeg_rs_raw::{
-    AvFrameRef, AvPacketRef, Decoder, Demuxer, DemuxerInfo, Resample, Scaler, StreamType,
-    get_frame_from_hw, rstr,
+    AudioFifo, AvFrameRef, AvPacketRef, Decoder, Demuxer, DemuxerInfo, Resample, Scaler,
+    StreamType, get_frame_from_hw, rstr,
 };
-use log::error;
+use log::{error, warn};
+use std::io::Write;
 use std::mem::transmute;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
@@ -70,6 +71,7 @@ struct DecoderThread {
     decoder: Decoder,
     scaler: Scaler,
     resample: Resample,
+    audio_fifo: AudioFifo,
     info: Option<DemuxerInfo>,
 }
 
@@ -145,40 +147,55 @@ impl DecoderThread {
     }
 
     fn send_audio(&mut self, frame: AvFrameRef, stream_index: i32, q: f64) -> Result<()> {
+        let target_sample_rate = self.data.playback.sample_rate.load(Ordering::Relaxed);
+        let target_channels = self.data.playback.channels.load(Ordering::Relaxed);
+        if self.resample.sample_rate() != target_sample_rate as _
+            || self.resample.channels() != target_channels as _
+        {
+            warn!("Sample rate or channel count changed!");
+            self.resample.set_sample_rate(target_sample_rate as _);
+            self.resample.set_channels(target_channels as _);
+        }
         let frame = self.resample.process_frame(&frame)?;
-        self.data.tx_a.send(AudioSamples {
-            data: unsafe {
-                frame
-                    .data
-                    .iter()
-                    .filter_map(|data| {
-                        if data.is_null() {
-                            None
-                        } else {
-                            Some(
-                                std::slice::from_raw_parts(
-                                    *data as *mut _,
-                                    frame.linesize[0] as _,
+        self.audio_fifo.buffer_frame(&frame)?;
+        drop(frame);
+
+        while let Some(f) = self.audio_fifo.get_frame(512 * target_channels as usize)? {
+            let bps = unsafe { av_get_bytes_per_sample(FfmpegDecoder::OUT_SAMPLE_FORMAT) };
+
+            self.data.tx_a.send(AudioSamples {
+                data: unsafe {
+                    f.data
+                        .iter()
+                        .filter_map(|data| {
+                            if data.is_null() {
+                                None
+                            } else {
+                                Some(
+                                    std::slice::from_raw_parts(
+                                        *data as *const _,
+                                        f.linesize[0] as usize / bps as usize,
+                                    )
+                                    .to_vec(),
                                 )
-                                .to_vec(),
-                            )
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            },
-            samples: frame.nb_samples as usize,
-            stream_index,
-            pts: if frame.pts != AV_NOPTS_VALUE {
-                frame.pts as f64 * q
-            } else {
-                0.0
-            },
-            duration: if frame.duration != AV_NOPTS_VALUE {
-                frame.duration as f64 * q
-            } else {
-                0.0
-            },
-        })?;
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                },
+                samples: f.nb_samples as usize,
+                stream_index,
+                pts: if f.pts != AV_NOPTS_VALUE {
+                    f.pts as f64 * q
+                } else {
+                    0.0
+                },
+                duration: if f.duration != AV_NOPTS_VALUE {
+                    f.duration as f64 * q
+                } else {
+                    0.0
+                },
+            })?;
+        }
         Ok(())
     }
 
@@ -314,6 +331,10 @@ impl MediaDecoderImpl for FfmpegDecoder {
                 self.data.playback.sample_rate.load(Ordering::Relaxed),
                 self.data.playback.channels.load(Ordering::Relaxed) as _,
             ),
+            audio_fifo: AudioFifo::new(
+                Self::OUT_SAMPLE_FORMAT,
+                self.data.playback.channels.load(Ordering::Relaxed) as _,
+            )?,
             info: None,
         };
         Ok(std::thread::Builder::new()
